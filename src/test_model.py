@@ -1,176 +1,156 @@
+#!/usr/bin/env python
+"""Model evaluation script
+
+Runs inference on the *testing* split, computes a global confusion matrix,
+reconstructs full‑image masks and saves them to `outputs/predicted_masks/`.
+"""
+
 import os
-import torch
+import argparse
+from pathlib import Path
+
 import numpy as np
+import torch
 from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 import rasterio
-import argparse
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
 
 from dataloader import segDataset
 from model import UNet
 
-# Enhetskonfigurasjon
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Bruker enhet: {device}")
+# -----------------------------------------------------------------------------
+# device
+# -----------------------------------------------------------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
 
-# Les kommandolinjeargumenter
-parser = argparse.ArgumentParser(description='Inferensskript med forvirringsmatrise og maskelagring')
-parser.add_argument('--data_root', type=str, default=r'C:\Users\milge\OneDrive\Dokumenter\Johansen\Bachelor Oppgave\Database', help='Rotkatalog for ditt datasett')
-parser.add_argument('--model_path', type=str, default=r'C:\Users\milge\OneDrive\Dokumenter\Johansen\Bachelor Oppgave\saved_models\training_20241108_095403_focalloss_bilinear_124_B64\best_model.pth', help='Sti til din lagrede modell')
-parser.add_argument('--batch_size', type=int, default=4, help='Batch-størrelse for DataLoader')
-parser.add_argument('--patch_size', type=int, default=124, help='Flisstørrelse')
-parser.add_argument('--threshold', type=float, default=0.5, help='Terskel for klasseseparasjon')
-parser.add_argument('--save_dir', type=str, default='PREDIKTERTE_MASKER_DIR', help='Katalog for å lagre predikerte masker')
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+parser = argparse.ArgumentParser(
+    description="Run inference on the testing set, compute confusion matrices and write georeferenced masks.")
+parser.add_argument("--data_root", type=str, default="./data", help="Root folder with a 'testing' subdir.")
+parser.add_argument("--model_path", type=str, default="./saved_models/best_model.pth", help="Trained model .pth file")
+parser.add_argument("--batch_size", type=int, default=4, help="Batch size for DataLoader")
+parser.add_argument("--patch_size", type=int, default=124, help="Tile size in pixels")
+parser.add_argument("--threshold", type=float, default=0.5, help="Class‑1 probability threshold")
+parser.add_argument("--save_dir", type=str, default="outputs/predicted_masks", help="Output root directory")
 args = parser.parse_args()
 
-# Parametere fra kommandolinjeargumenter
-data_root = args.data_root
-model_path = args.model_path
-batch_size = args.batch_size
-patch_size = args.patch_size
-threshold = args.threshold
-save_dir = args.save_dir
+# -----------------------------------------------------------------------------
+# paths
+# -----------------------------------------------------------------------------
+TEST_ROOT = Path(args.data_root) / "testing"
+MODEL_PATH = Path(args.model_path)
+MODEL_NAME = MODEL_PATH.parent.name or "model"
+OUTPUT_DIR = Path(args.save_dir) / MODEL_NAME
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+print(f"Testing data root: {TEST_ROOT}")
 
-# Bruk modellenavn for å lage en unik lagringskatalog
-model_name = os.path.basename(os.path.dirname(model_path))  # Extract the folder name for the model
-output_dir = os.path.join(save_dir, model_name)
-os.makedirs(output_dir, exist_ok=True)  # Create the directory if it doesn't exist
+# -----------------------------------------------------------------------------
+# dataset & loader
+# -----------------------------------------------------------------------------
+dataset = segDataset(root=str(TEST_ROOT), patch_size=args.patch_size, mode="train", transform=transforms.Compose([]))
 
-# Transformasjoner
-transform = transforms.Compose([])
-
-# Last inn testdatasettet
-testing_root = os.path.join(data_root, 'testing')
-print(f"Testdata rotkatalog: {testing_root}")
-
-testing_dataset = segDataset(root=testing_root, patch_size=patch_size, mode='train', transform=transform)
-
-# Egendefinert collate-funksjon
-def custom_collate_fn(batch):
-    if len(batch) == 0:
+def collate(batch):
+    if not batch:
         return None
+    images, annotations, positions, img_idx = zip(*batch)
+    return torch.stack(images), torch.stack(annotations), list(positions), list(img_idx)
 
-    images, annotations, positions, image_indices = [], [], [], []
-    for item in batch:
-        images.append(item[0])
-        annotations.append(item[1])
-        positions.append(item[2])
-        image_indices.append(item[3])
-    images = torch.stack(images, 0)
-    annotations = torch.stack(annotations, 0)
-    return images, annotations, positions, image_indices
+loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate)
 
-# Opprett DataLoader
-testing_dataloader = DataLoader(
-    testing_dataset,
-    batch_size=batch_size,
-    shuffle=False,
-    num_workers=0,
-    collate_fn=custom_collate_fn
-)
-
-# Initialiser modellen
-model = UNet(n_channels=3, n_classes=2, bilinear=True).to(device)
-model.load_state_dict(torch.load(model_path, map_location=device))
+# -----------------------------------------------------------------------------
+# model
+# -----------------------------------------------------------------------------
+model = UNet(n_channels=3, n_classes=2, bilinear=True).to(DEVICE)
+model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
 model.eval()
 
-# Initialiser lister for å samle etiketter
-true_labels_file = os.path.join(output_dir, 'true_labels.npy')
-predicted_labels_file = os.path.join(output_dir, 'predicted_labels.npy')
+# -----------------------------------------------------------------------------
+# files to accumulate labels (kept to avoid large RAM usage)
+# -----------------------------------------------------------------------------
+true_file = OUTPUT_DIR / "true_labels.npy"
+pred_file = OUTPUT_DIR / "predicted_labels.npy"
+for f in (true_file, pred_file):
+    if f.exists():
+        f.unlink()
 
-if os.path.exists(true_labels_file):
-    os.remove(true_labels_file)
-if os.path.exists(predicted_labels_file):
-    os.remove(predicted_labels_file)
+predictions_per_image = {}
 
-# Kjør inferens
+# -----------------------------------------------------------------------------
+# inference loop
+# -----------------------------------------------------------------------------
 with torch.no_grad():
-    predictions_per_image = {}
-    for batch in testing_dataloader:
+    for batch in loader:
         if batch is None:
             continue
+        imgs, annos, pos, idxs = batch
+        imgs = imgs.to(DEVICE)
+        probs = torch.softmax(model(imgs), dim=1)[:, 1, :, :]
+        preds = (probs > args.threshold).long().cpu().numpy()
+        annos_np = annos.cpu().numpy()
 
-        inputs, annotations, positions, image_indices = batch
-
-        inputs = inputs.to(device)
-        outputs = model(inputs)
-        probs = torch.softmax(outputs, dim=1)
-        class1_probs = probs[:, 1, :, :]
-
-        preds = (class1_probs > threshold).long()
-        preds = preds.cpu().numpy()
-
-        batch_size_actual = inputs.size(0)
-        for i in range(batch_size_actual):
+        for i in range(imgs.size(0)):
             pred_patch = preds[i]
-            true_patch = annotations[i].cpu().numpy()
-            x, y = positions[i]
-            img_idx = image_indices[i]
+            true_patch = annos_np[i]
+            x, y = pos[i]
+            img_idx = idxs[i]
 
-            # Append true and predicted labels incrementally
-            with open(true_labels_file, 'ab') as f_true, open(predicted_labels_file, 'ab') as f_pred:
-                np.save(f_true, true_patch.flatten())
-                np.save(f_pred, pred_patch.flatten())
+            # append flat arrays to disk to save RAM
+            with open(true_file, "ab") as f_t, open(pred_file, "ab") as f_p:
+                np.save(f_t, true_patch.flatten())
+                np.save(f_p, pred_patch.flatten())
 
-            # Rekonstruer fullstendige bildemasker
+            # stitch mask back together
             if img_idx not in predictions_per_image:
-                height, width = testing_dataset.image_shapes[img_idx]
-                predictions_per_image[img_idx] = np.zeros((height, width), dtype=np.uint8)
+                h, w = dataset.image_shapes[img_idx]
+                predictions_per_image[img_idx] = np.zeros((h, w), dtype=np.uint8)
+            predictions_per_image[img_idx][x : x + args.patch_size, y : y + args.patch_size] = pred_patch
 
-            predictions_per_image[img_idx][x:x+patch_size, y:y+patch_size] = pred_patch
-
-        # Clear memory
-        del inputs, annotations, outputs, probs, preds
         torch.cuda.empty_cache()
 
-# Les lagrede etiketter og beregn forvirringsmatrise
-all_true_labels = np.load(true_labels_file, allow_pickle=True)
-all_predicted_labels = np.load(predicted_labels_file, allow_pickle=True)
+# -----------------------------------------------------------------------------
+# global confusion matrix
+# -----------------------------------------------------------------------------
+true_arr = np.concatenate(np.load(true_file, allow_pickle=True))
+pred_arr = np.concatenate(np.load(pred_file, allow_pickle=True))
+cm = confusion_matrix(true_arr, pred_arr)
+cm_norm = confusion_matrix(true_arr, pred_arr, normalize="true")
+class_names = ["Other", "Tree"]
 
-cm = confusion_matrix(np.concatenate(all_true_labels), np.concatenate(all_predicted_labels))
-cm_normalized = confusion_matrix(np.concatenate(all_true_labels), np.concatenate(all_predicted_labels), normalize='true')
+fig_path = OUTPUT_DIR / "confusion_matrix.png"
+fig_norm_path = OUTPUT_DIR / "confusion_matrix_normalized.png"
 
-# Definer klassenavn
-class_names = ['Annet', 'TreDekke']
+for matrix, path, title in (
+    (cm, fig_path, "Confusion Matrix – Test set"),
+    (cm_norm, fig_norm_path, "Normalized Confusion Matrix – Test set"),
+):
+    disp = ConfusionMatrixDisplay(confusion_matrix=matrix, display_labels=class_names)
+    disp.plot(cmap=plt.cm.Blues)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
 
-# Plot forvirringsmatriser
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
-disp.plot(cmap=plt.cm.Blues)
-plt.title('Forvirringsmatrise (Testsett)')
-plt.savefig(os.path.join(output_dir, 'confusion_matrix_test_set.png'))
-plt.close()
+print("[INFO] Confusion matrices saved.")
 
-disp_normalized = ConfusionMatrixDisplay(confusion_matrix=cm_normalized, display_labels=class_names)
-disp_normalized.plot(cmap=plt.cm.Blues)
-plt.title('Normalisert forvirringsmatrise (Testsett)')
-plt.savefig(os.path.join(output_dir, 'normalized_confusion_matrix_test_set.png'))
-plt.close()
-
-print("Forvirringsmatrise er beregnet og lagret.")
-
-# Lagre rekonstruerte masker
-for img_idx, reconstructed_mask in predictions_per_image.items():
-    original_image_path = testing_dataset.IMG_NAMES[img_idx]
-    with rasterio.open(original_image_path) as src:
+# -----------------------------------------------------------------------------
+# save reconstructed masks
+# -----------------------------------------------------------------------------
+for img_idx, mask in predictions_per_image.items():
+    src_path = dataset.IMG_NAMES[img_idx]
+    with rasterio.open(src_path) as src:
         meta = src.meta.copy()
-        transform = src.transform
-        crs = src.crs
+    meta.update({"count": 1, "dtype": "uint8", "compress": "lzw"})
 
-    meta.update({
-        'count': 1,
-        'dtype': 'uint8',
-        'compress': 'lzw'
-    })
+    h, w = dataset.image_shapes[img_idx]
+    mask = mask[:h, :w]
 
-    height, width = testing_dataset.image_shapes[img_idx]
-    reconstructed_mask = reconstructed_mask[:height, :width]
-
-    output_filename = os.path.basename(original_image_path)
-    output_filename = os.path.splitext(output_filename)[0] + '_mask.tif'
-    output_path = os.path.join(output_dir, output_filename)
-
-    with rasterio.open(output_path, 'w', **meta) as dst:
-        dst.write(reconstructed_mask.astype(rasterio.uint8), 1)
-    print(f"Predikert maske lagret til {output_path}")
+    image_name = Path(src_path).stem
+    out_path = OUTPUT_DIR / f"{image_name}_mask.tif"
+    with rasterio.open(out_path, "w", **meta) as dst:
+        dst.write(mask.astype(rasterio.uint8), 1)
+    print(f"[INFO] Saved mask → {out_path}")

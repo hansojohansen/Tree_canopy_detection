@@ -1,141 +1,137 @@
+#!/usr/bin/env python
+"""Dataset loader for aerial‐imagery segmentation.
+
+* Splits each image (and optional annotation) into fixed‑size non‑overlapping
+  patches.
+* Supports `train` mode (expects matching `annotations/` folder) and
+  `inference` mode (images only).
+
+"""
+
+from __future__ import annotations
+import os
+from glob import glob
+import random  # retained for potential future augmentations
+
 import numpy as np
 import torch
-import torchvision.transforms as transforms
-from glob import glob
-import os
-import rasterio
-from rasterio.enums import Resampling
 from rasterio.crs import CRS
-import matplotlib.pyplot as plt
-import random
+import rasterio
+import matplotlib.pyplot as plt  # noqa: F401 (import kept in case of debug plotting)
 
-''' 
-Velg størrelse på ruter, trenings- eller testmodus (inference), og andre parametere dersom nødvendig 
-'''
+
 class segDataset(torch.utils.data.Dataset):
-    def __init__(self, root, patch_size=124, mode="inference", crs=None, res=None, transform=None):
-        super(segDataset, self).__init__()
+    """Patch‑based dataset for segmentation models."""
+
+    def __init__(
+        self,
+        root: str,
+        patch_size: int = 124,
+        mode: str = "inference",
+        crs: CRS | None = None,
+        res: float | None = None,
+        transform=None,
+    ) -> None:
+        super().__init__()
         self.root = root
         self.patch_size = patch_size
-        self.mode = mode  # "train" eller "inference" (inference = testing uten annoteringsbilder)
+        self.mode = mode  # "train" (images+annotations) or "inference" (images only)
         self.transform = transform
-        self.crs = CRS.from_epsg(25833) if crs is None else crs  # Standard CRS hvis ikke spesifisert
-        self.res = 0.25 if res is None else res  # Standard oppløsning hvis ikke spesifisert
-        images_path = os.path.join(self.root, 'images', '*.tif')  # Sti til bildefiler
-        
-        self.IMG_NAMES = sorted(glob(images_path))  # Hent og sorter alle bildefiler
-        print(f"Lastet {len(self.IMG_NAMES)} bilder fra {images_path}")
+        self.crs = CRS.from_epsg(25833) if crs is None else crs  # default UTM 33N
+        self.res = 0.25 if res is None else res  # default 25 cm resolution
 
-        # Lister for å lagre alle bildefeltene og deres posisjoner
-        self.image_patches = []
-        self.annotation_patches = [] if self.mode == "train" else None  # Bare nødvendig i treningsmodus
-        self.positions = []
-        self.image_indices = []  # Holder styr på bildeindekser
-        self.image_shapes = []  # Lagrer originale bildestørrelser
+        images_path = os.path.join(self.root, "images", "*.tif")
+        self.IMG_NAMES = sorted(glob(images_path))
+        print(f"Loaded {len(self.IMG_NAMES)} images from {images_path}")
 
-        # Opprett felter ved initialisering
+        # containers
+        self.image_patches: list[np.ndarray] = []
+        self.annotation_patches: list[np.ndarray] | None = [] if self.mode == "train" else None
+        self.positions: list[tuple[int, int]] = []
+        self.image_indices: list[int] = []
+        self.image_shapes: list[tuple[int, int]] = []
+
         self._create_patches()
+
+    # ---------------------------------------------------------------------
+    # internal helpers
+    # ---------------------------------------------------------------------
 
     def _create_patches(self):
         for img_idx, img_path in enumerate(self.IMG_NAMES):
-            # Sjekker bare for annotasjoner i treningsmodus
+            # locate matching annotation file (if in train mode)
             if self.mode == "train":
-                annotation_path = img_path.replace('images', 'annotations')  # Antatt struktur for annotasjoner
-                if not os.path.exists(annotation_path):
-                    print(f"Advarsel: Annotasjonsfil ikke funnet for {img_path}. Hopper over denne filen.")
+                anno_path = img_path.replace("images", "annotations")
+                if not os.path.exists(anno_path):
+                    print(f"[WARN] Annotation not found for {img_path} – skipped.")
                     continue
 
-            # Laster inn bildet
-            with rasterio.open(img_path) as src_image:
-                image = src_image.read().transpose(1, 2, 0)  # Transponerer for å få riktig dimensjon
-                image_meta = src_image.meta
-                image_res = src_image.res
-                image_transform = src_image.transform
-                print(f"Bilde Metadata for {img_path}: CRS={image_meta['crs']}, Transform={image_transform}, Oppløsning={image_res}")
-                self.image_shapes.append(image.shape[:2])  # Lagrer bildestørrelse (høyde, bredde)
+            # read image
+            with rasterio.open(img_path) as src_img:
+                image = src_img.read().transpose(1, 2, 0)  # to H,W,C
+                self.image_shapes.append(image.shape[:2])
 
-            # Laster inn annotasjonen hvis i treningsmodus
+            # read annotation
+            annotation = None
             if self.mode == "train":
-                with rasterio.open(annotation_path) as src_annotation:
-                    annotation_res = src_annotation.res
-                    annotation_transform = src_annotation.transform
-                    # Sjekk om annotasjonen har samme CRS og oppløsning som bildet
-                    #if annotation_res != image_res or annotation_transform != image_transform:
-                        #print(f"Reprojiserer annotasjon for å matche CRS og oppløsning: {annotation_path}")
-                        #annotation = src_annotation.read(
-                            #out_shape=(
-                                #src_annotation.count,
-                                #int(image.shape[0]),
-                                #int(image.shape[1])
-                            #),
-                            #resampling=Resampling.nearest
-                        #)[0]
-                    #else:
-                    annotation = src_annotation.read(1)  # Les første band
+                with rasterio.open(anno_path) as src_anno:
+                    annotation = src_anno.read(1)
 
-            # Genererer felter for både bilde (og annotasjon hvis i treningsmodus)
-            image_patches, annotation_patches, positions = self.crop_to_patches(
-                image, annotation if self.mode == "train" else None
-            )
-            num_patches = len(image_patches)
-            self.image_patches.extend(image_patches)
+            # generate patches
+            img_p, anno_p, pos = self.crop_to_patches(image, annotation)
+            self.image_patches.extend(img_p)
             if self.mode == "train":
-                self.annotation_patches.extend(annotation_patches)
-            self.positions.extend(positions)
-            self.image_indices.extend([img_idx] * num_patches)  # Holder styr på bildeindekser
+                self.annotation_patches.extend(anno_p)  # type: ignore[arg-type]
+            self.positions.extend(pos)
+            self.image_indices.extend([img_idx] * len(img_p))
 
-        print(f"Genererte {len(self.image_patches)} felter fra bilder i {self.root}")
+        print(f"Generated {len(self.image_patches)} patches from dataset {self.root}")
 
-    def crop_to_patches(self, image, annotation=None):
-        patches = []
-        annotation_patches = [] if annotation is not None else None
-        positions = []
-
-        height, width, _ = image.shape
+    def crop_to_patches(self, image: np.ndarray, annotation: np.ndarray | None = None):
+        patches, anno_patches, positions = [], [], []
+        h, w, _ = image.shape
         stride = self.patch_size
-
-        for i in range(0, height - stride + 1, stride):
-            for j in range(0, width - stride + 1, stride):
-                image_patch = image[i:i+stride, j:j+stride]
+        for i in range(0, h - stride + 1, stride):
+            for j in range(0, w - stride + 1, stride):
+                img_patch = image[i : i + stride, j : j + stride]
+                if img_patch.shape[:2] != (stride, stride):
+                    print(f"[INFO] skipping patch at ({i},{j}) – size mismatch")
+                    continue
+                patches.append(img_patch)
+                positions.append((i, j))
                 if annotation is not None:
-                    annotation_patch = annotation[i:i+stride, j:j+stride]
+                    anno_patch = annotation[i : i + stride, j : j + stride]
+                    anno_patches.append(anno_patch)
+        return patches, anno_patches if annotation is not None else None, positions
 
-                # Legger bare til felter med forventet størrelse
-                if image_patch.shape[:2] == (stride, stride):
-                    patches.append(image_patch)
-                    positions.append((i, j))
-                    if annotation is not None and annotation_patch.shape == (stride, stride):
-                        annotation_patches.append(annotation_patch)
-                else:
-                    print(f"Hopper over felt ved ({i},{j}) på grunn av størrelsesmismatch")
+    # ------------------------------------------------------------------
+    # PyTorch Dataset interface
+    # ------------------------------------------------------------------
 
-        return patches, annotation_patches, positions if annotation_patches is not None else positions
+    def __getitem__(self, idx):
+        img_patch = self.image_patches[idx]          # H × W × C, uint8
+        pos       = self.positions[idx]
+        img_idx   = self.image_indices[idx]
 
-    def __getitem__(self, idx): 
-        image_patch = self.image_patches[idx]
-        position = self.positions[idx]
-        img_idx = self.image_indices[idx]
+        # --- convert to Torch tensor -------------------------------------------------
+        # 1.  float32  [& optional 0-1 scaling]
+        img_patch = img_patch.astype(np.float32) / 255.0
+        # 2.  channel-first  (C, H, W)
+        img_patch = np.moveaxis(img_patch, -1, 0)
+        # 3.  torch tensor
+        img_patch = torch.from_numpy(img_patch)      # dtype = float32
 
-        # Transformer bildefelt til tensor
-        image_patch = np.moveaxis(image_patch, -1, 0)  # Flytter kanaler til første dimensjon
         if self.mode == "train":
-            annotation_patch = self.annotation_patches[idx]
-            
-            # Apply scaling for train mode
-            image_patch = image_patch.astype(np.float32) * 0.70
-            
+            anno_patch = self.annotation_patches[idx].astype(np.int64)
             return (
-                torch.tensor(image_patch, dtype=torch.float32),
-                torch.tensor(annotation_patch, dtype=torch.int64),
-                position,
-                img_idx
+                img_patch,                           # float32  (C, H, W)
+                torch.from_numpy(anno_patch),        # int64    (H, W)
+                pos,
+                img_idx,
             )
         else:
-            return (
-                torch.tensor(image_patch, dtype=torch.float32),
-                position,
-                img_idx
-            )
+            return img_patch, pos, img_idx
+
 
     def __len__(self):
         return len(self.image_patches)

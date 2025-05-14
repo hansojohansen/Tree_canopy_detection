@@ -1,0 +1,7 @@
+LICENSE
+README.md
+setup.py
+src/treecanopy.egg-info/PKG-INFO
+src/treecanopy.egg-info/SOURCES.txt
+src/treecanopy.egg-info/dependency_links.txt
+src/treecanopy.egg-info/top_level.txt

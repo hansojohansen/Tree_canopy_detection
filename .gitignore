@@ -1,0 +1,12 @@
+# Large / private stuff
+data/
+saved_models/*.pth
+outputs/
+*.tif
+*.png
+*.npy
+
+# Python cruft
+__pycache__/
+*.pyc
+.env

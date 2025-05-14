@@ -1,0 +1,28 @@
+name: treecanopy
+channels:
+  # conda-forge first for geospatial libs (rasterio/GDAL)
+  - conda-forge
+  - pytorch          # official PyTorch channel
+  - nvidia           # pulls matching CUDA runtime
+dependencies:
+  # ── core ────────────────────────────────────────────────
+  - python = 3.11         # tested with 3.11.x
+  - pip
+
+  # ── science / utils ─────────────────────────────────────
+  - numpy  = 1.26.4       # PyTorch 2.2 wheels need the 1.x ABI
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - tqdm
+  - rasterio              # brings in GDAL
+
+  # ── deep-learning (GPU build) ───────────────────────────
+  - pytorch       = 2.2.2
+  - torchvision   = 0.17.2
+  - pytorch-cuda  = 12.1    # **if your NVIDIA driver ≥ 528**.
+                            # Use `11.8` instead if you’re on an older driver.
+
+  # ── OpenCV & friends (wheel only) ───────────────────────
+  - pip:
+      - "opencv-python-headless==4.9.0.80"
