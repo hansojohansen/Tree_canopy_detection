@@ -98,5 +98,5 @@ This repository includes code adapted from prior work distributed under [GNU GPL
 
 ## Contact
 - **Authors:** Aslak Brynsrud · Hans Olav Lien Johansen  
-- **Institution:** NTNU, Department of Manufacturing and Civil Engineering  
+- **Institution:** NTNU, Norwegian Lilitary Academy
 - **Date of Submission:** May 2024
