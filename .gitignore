@@ -1,7 +1,7 @@
 # Ignore all files in data/
-data/**
+#data/**
 # Except .gitkeep files
-!data/**/.gitkeep
+#!data/**/.gitkeep
 saved_models/*.pth
 outputs/
 *.tif
