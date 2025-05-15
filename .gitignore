@@ -1,5 +1,7 @@
-# Large / private stuff
-data/
+# Ignore all files in data/
+data/**
+# Except .gitkeep files
+!data/**/.gitkeep
 saved_models/*.pth
 outputs/
 *.tif
