@@ -1,0 +1,6 @@
+Make sure the names of annotation and image is the same.
+
+example:
+
+training - annotation folder - example_2022.tif
+training - images folder - example_2022.tif
